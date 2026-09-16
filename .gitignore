@@ -1,0 +1,39 @@
+### Android / Gradle build outputs ###
+*.apk
+*.aab
+*.ap_
+*.dex
+build/
+app/build/
+*/build/
+.cxx/
+captures/
+.externalNativeBuild/
+
+### Gradle local cache (NOT the wrapper itself) ###
+.gradle/
+
+### Local machine-specific config ###
+local.properties
+
+### Android Studio / IntelliJ project files ###
+.idea/
+*.iml
+*.ipr
+*.iws
+.navigation/
+out/
+
+### macOS ###
+.DS_Store
+
+### Signing keys & secrets — never commit these ###
+*.jks
+*.keystore
+key.properties
+*.env
+.env
+secrets.properties
+
+### Logs ###
+*.log
