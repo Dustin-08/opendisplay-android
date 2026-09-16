@@ -2,6 +2,11 @@ package com.example.opendisplayandroid
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.net.nsd.NsdManager
@@ -9,11 +14,15 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
+import android.widget.FrameLayout
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.ServerSocket
@@ -59,6 +68,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private lateinit var surfaceView: SurfaceView
+    private lateinit var cursorOverlay: CursorOverlayView
     private var surface: android.view.Surface? = null
 
     private var serverSocket: ServerSocket? = null
@@ -85,9 +95,25 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         surfaceView = SurfaceView(this)
-        setContentView(surfaceView)
+        cursorOverlay = CursorOverlayView(this)
+
+        // Video on the bottom, cursor overlay on top, both filling the
+        // window. SurfaceView punches a hole through the window by default
+        // (no setZOrderOnTop calls here), so a normal View added after it in
+        // the same FrameLayout composites above it — no special Z handling
+        // needed for the overlay to render over the decoded video.
+        val root = FrameLayout(this)
+        val matchParent = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT
+        )
+        root.addView(surfaceView, matchParent)
+        root.addView(cursorOverlay, matchParent)
+        setContentView(root)
+
         surfaceView.holder.addCallback(this)
-        surfaceView.setOnTouchListener { _, event -> handleTouch(event); true }
+        // Touch listener lives on the overlay (the topmost view) since it's
+        // the one actually receiving touch events now.
+        cursorOverlay.setOnTouchListener { _, event -> handleTouch(event); true }
 
         nsdManager = getSystemService(Context.NSD_SERVICE) as NsdManager
 
@@ -163,6 +189,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         outStream = output
 
         sendHello() // MUST be first message on every new connection
+        requestKeyframe() // ask for a full frame right away instead of
+        // waiting on the sender's periodic keyframe
+        // interval — this is what was causing the long
+        // black-screen delay on an idle desktop
         startPing(socket)
 
         try {
@@ -278,8 +308,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 "pong" -> {}
                 "welcome" -> Log.i(TAG, "sender welcome: pv=${json.optInt("pv")} min=${json.optInt("min")}")
                 "updateRequired" -> Log.w(TAG, "sender requires update: ${json.optString("message")}")
-                "sleeping", "closing" -> Log.i(TAG, "sender ending session (${json.optString("type")})")
-                else -> {} // unknown types MUST be ignored, per spec
+                "sleeping", "closing" -> {
+                    Log.i(TAG, "sender ending session (${json.optString("type")})")
+                    cursorOverlay.hide()
+                }
+                "cursor" -> handleCursorMessage(json)
+                // Unknown types MUST be ignored per spec, but we log the raw
+                // JSON here — if "cursor" turns out to use a different type
+                // string on the wire, this line will show us the real one.
+                else -> Log.d(TAG, "unhandled control message: $json")
             }
         } catch (e: Exception) {
             // not valid JSON — MUST be ignored, not fatal, per spec section 6
@@ -341,12 +378,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun createDecoder() {
         try {
-            // TODO: parse the real width/height out of the SPS (section 5.2
-            // says receivers MUST take dimensions from the SPS, not hello).
-            // 1920x1080 is just a starting guess; MediaCodec corrects itself
-            // via INFO_OUTPUT_FORMAT_CHANGED once real frames arrive, but a
-            // wildly wrong initial size can make some devices reject configure().
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080)
+            // Section 5.2 says receivers MUST take dimensions from the SPS,
+            // not from hello. We now parse them for real instead of guessing
+            // 1920x1080 and hoping MediaCodec self-corrects — a wildly wrong
+            // initial size makes some devices reject configure() outright.
+            val (w, h) = sps?.let { parseSpsDimensions(it) } ?: run {
+                Log.w(TAG, "SPS dimension parse failed, falling back to 1920x1080 guess")
+                1920 to 1080
+            }
+            Log.i(TAG, "configuring decoder at ${w}x${h}")
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h)
             format.setByteBuffer("csd-0", ByteBuffer.wrap(sps))
             format.setByteBuffer("csd-1", ByteBuffer.wrap(pps))
             val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -360,12 +401,276 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    // ---------------------------------------------------------------
+    // SPS parsing (H.264 spec section 7.3.2.1.1 / 7.4.2.1.1) — just enough
+    // exp-golomb decoding to recover pic width/height + cropping. Handles
+    // baseline/main/high profiles; scaling-matrix lists are skipped (their
+    // values don't affect width/height) rather than fully decoded.
+    // ---------------------------------------------------------------
+
+    private fun parseSpsDimensions(spsNal: ByteArray): Pair<Int, Int>? {
+        return try {
+            // spsNal still has its 4-byte Annex B start code + 1-byte NAL
+            // header (see extractParamSets) — RBSP payload starts at index 5.
+            val rbsp = unescapeRbsp(spsNal, 5)
+            val br = BitReader(rbsp)
+
+            val profileIdc = br.readBits(8)
+            br.skipBits(8)  // constraint_set0..5_flag (6 bits) + reserved (2 bits)
+            br.skipBits(8)  // level_idc
+            br.readUE()     // seq_parameter_set_id
+
+            var chromaFormatIdc = 1
+            if (profileIdc in HIGH_PROFILES_WITH_CHROMA_INFO) {
+                chromaFormatIdc = br.readUE()
+                if (chromaFormatIdc == 3) br.skipBits(1) // separate_colour_plane_flag
+                br.readUE() // bit_depth_luma_minus8
+                br.readUE() // bit_depth_chroma_minus8
+                br.skipBits(1) // qpprime_y_zero_transform_bypass_flag
+                if (br.readBit() == 1) { // seq_scaling_matrix_present_flag
+                    val count = if (chromaFormatIdc != 3) 8 else 12
+                    for (i in 0 until count) {
+                        if (br.readBit() == 1) skipScalingList(br, if (i < 6) 16 else 64)
+                    }
+                }
+            }
+
+            br.readUE() // log2_max_frame_num_minus4
+            when (br.readUE()) { // pic_order_cnt_type
+                0 -> br.readUE() // log2_max_pic_order_cnt_lsb_minus4
+                1 -> {
+                    br.skipBits(1) // delta_pic_order_always_zero_flag
+                    br.readSE() // offset_for_non_ref_pic
+                    br.readSE() // offset_for_top_to_bottom_field
+                    val numRefFrames = br.readUE()
+                    repeat(numRefFrames) { br.readSE() }
+                }
+                // type 2: nothing further to read
+            }
+
+            br.readUE() // max_num_ref_frames
+            br.skipBits(1) // gaps_in_frame_num_value_allowed_flag
+            val picWidthInMbsMinus1 = br.readUE()
+            val picHeightInMapUnitsMinus1 = br.readUE()
+            val frameMbsOnlyFlag = br.readBit()
+            if (frameMbsOnlyFlag == 0) br.skipBits(1) // mb_adaptive_frame_field_flag
+            br.skipBits(1) // direct_8x8_inference_flag
+
+            var cropLeft = 0; var cropRight = 0; var cropTop = 0; var cropBottom = 0
+            if (br.readBit() == 1) { // frame_cropping_flag
+                cropLeft = br.readUE()
+                cropRight = br.readUE()
+                cropTop = br.readUE()
+                cropBottom = br.readUE()
+            }
+
+            var width = (picWidthInMbsMinus1 + 1) * 16
+            var height = (2 - frameMbsOnlyFlag) * (picHeightInMapUnitsMinus1 + 1) * 16
+
+            val cropUnitX: Int
+            val cropUnitY: Int
+            if (chromaFormatIdc == 0) {
+                cropUnitX = 1
+                cropUnitY = 2 - frameMbsOnlyFlag
+            } else {
+                val subWidthC = if (chromaFormatIdc == 3) 1 else 2
+                val subHeightC = if (chromaFormatIdc == 1) 2 else 1
+                cropUnitX = subWidthC
+                cropUnitY = subHeightC * (2 - frameMbsOnlyFlag)
+            }
+            width -= cropUnitX * (cropLeft + cropRight)
+            height -= cropUnitY * (cropTop + cropBottom)
+
+            if (width <= 0 || height <= 0) null else width to height
+        } catch (e: Exception) {
+            Log.w(TAG, "SPS parse error: ${e.message}")
+            null
+        }
+    }
+
+    private fun skipScalingList(br: BitReader, size: Int) {
+        var lastScale = 8
+        var nextScale = 8
+        repeat(size) {
+            if (nextScale != 0) {
+                val deltaScale = br.readSE()
+                nextScale = (lastScale + deltaScale + 256) % 256
+            }
+            lastScale = if (nextScale == 0) lastScale else nextScale
+        }
+    }
+
+    /** Strips Annex B emulation-prevention 0x03 bytes, starting after the NAL header. */
+    private fun unescapeRbsp(nal: ByteArray, headerOffset: Int): ByteArray {
+        val out = ByteArrayOutputStream(nal.size)
+        var zeroRun = 0
+        for (i in headerOffset until nal.size) {
+            val b = nal[i]
+            if (zeroRun >= 2 && b.toInt() == 0x03) {
+                zeroRun = 0
+                continue
+            }
+            out.write(b.toInt())
+            zeroRun = if (b.toInt() == 0) zeroRun + 1 else 0
+        }
+        return out.toByteArray()
+    }
+
+    /** Profile IDCs whose SPS carries the extra chroma/bit-depth/scaling fields (7.3.2.1.1). */
+    private val HIGH_PROFILES_WITH_CHROMA_INFO =
+        setOf(100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135)
+
+    /** Minimal MSB-first bit reader for exp-golomb SPS parsing. */
+    private class BitReader(private val data: ByteArray) {
+        private var bitPos = 0
+        fun readBit(): Int {
+            val bytePos = bitPos / 8
+            if (bytePos >= data.size) throw IndexOutOfBoundsException("SPS bit overrun")
+            val bit = (data[bytePos].toInt() shr (7 - (bitPos % 8))) and 1
+            bitPos++
+            return bit
+        }
+        fun readBits(n: Int): Int {
+            var v = 0
+            repeat(n) { v = (v shl 1) or readBit() }
+            return v
+        }
+        fun skipBits(n: Int) { repeat(n) { readBit() } }
+        fun readUE(): Int {
+            var leadingZeroBits = 0
+            while (readBit() == 0) {
+                leadingZeroBits++
+                if (leadingZeroBits > 32) throw IllegalStateException("bad exp-golomb code")
+            }
+            if (leadingZeroBits == 0) return 0
+            val suffix = readBits(leadingZeroBits)
+            return (1 shl leadingZeroBits) - 1 + suffix
+        }
+        fun readSE(): Int {
+            val codeNum = readUE()
+            val sign = if (codeNum % 2 == 0) -1 else 1
+            return sign * ((codeNum + 1) / 2)
+        }
+    }
+
     private fun resetDecoder() {
         try { decoder?.stop() } catch (e: Exception) {}
         try { decoder?.release() } catch (e: Exception) {}
         decoder = null
         sps = null
         pps = null
+        cursorOverlay.hide() // stale cursor position shouldn't survive a reconnect
+    }
+
+    // ---------------------------------------------------------------
+    // Local cursor echo — the sender renders the pointer off the video
+    // path (see release notes: "local cursor echo — pointer rendered
+    // on-device off the video path") and instead pushes small JSON control
+    // messages with the pointer's position (and optionally a sprite image).
+    //
+    // NOTE: the exact field names below are a best-effort guess — the
+    // upstream PROTOCOL.md section for this wasn't available to check
+    // directly. handleControlMessage() logs the raw JSON for any message
+    // type it doesn't recognize, so if the cursor never appears, check
+    // logcat for "unhandled control message" and we can fix the field
+    // names to match exactly what's actually on the wire.
+    // ---------------------------------------------------------------
+
+    private fun handleCursorMessage(json: JSONObject) {
+        try {
+            val visible = if (json.has("visible")) json.optBoolean("visible", true) else true
+            val x = firstDouble(json, "x", "cursorX", "px")
+            val y = firstDouble(json, "y", "cursorY", "py")
+            if (x == null || y == null) {
+                Log.d(TAG, "cursor message missing x/y, raw: $json")
+                return
+            }
+
+            var bitmap: Bitmap? = null
+            val imageB64 = firstString(json, "image", "sprite", "imageData")
+            if (imageB64 != null) {
+                try {
+                    val bytes = Base64.decode(imageB64, Base64.DEFAULT)
+                    bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                } catch (e: Exception) {
+                    Log.w(TAG, "cursor sprite decode failed: ${e.message}")
+                }
+            }
+            // Hotspot as a 0..1 fraction of the sprite's own size; defaults
+            // to the top-left corner if the sender doesn't send one, since
+            // most arrow-style pointers hotspot near their tip, not center.
+            val hotX = (firstDouble(json, "hotX", "hotspotX", "anchorX") ?: 0.0).toFloat()
+            val hotY = (firstDouble(json, "hotY", "hotspotY", "anchorY") ?: 0.0).toFloat()
+
+            cursorOverlay.update(visible, x.toFloat(), y.toFloat(), bitmap, hotX, hotY)
+        } catch (e: Exception) {
+            Log.w(TAG, "cursor message parse error: ${e.message}")
+        }
+    }
+
+    private fun firstDouble(json: JSONObject, vararg keys: String): Double? {
+        for (k in keys) if (json.has(k)) return json.optDouble(k)
+        return null
+    }
+
+    private fun firstString(json: JSONObject, vararg keys: String): String? {
+        for (k in keys) if (json.has(k)) return json.optString(k)
+        return null
+    }
+
+    /**
+     * Transparent overlay drawn on top of the SurfaceView. Shows either a
+     * decoded cursor sprite bitmap (if the sender provides one) or a plain
+     * dot fallback, positioned from normalized 0..1 coordinates against this
+     * view's own size (which matches the video's displayed size 1:1).
+     */
+    private class CursorOverlayView(context: Context) : View(context) {
+        @Volatile private var visible = false
+        @Volatile private var xFrac = 0.5f
+        @Volatile private var yFrac = 0.5f
+        @Volatile private var bitmap: Bitmap? = null
+        @Volatile private var hotXFrac = 0f
+        @Volatile private var hotYFrac = 0f
+
+        private val dotFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        private val dotOutline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.BLACK
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+
+        fun update(visible: Boolean, xFrac: Float, yFrac: Float, bitmap: Bitmap?, hotXFrac: Float, hotYFrac: Float) {
+            this.visible = visible
+            this.xFrac = xFrac
+            this.yFrac = yFrac
+            if (bitmap != null) this.bitmap = bitmap // keep last sprite if none sent this time
+            this.hotXFrac = hotXFrac
+            this.hotYFrac = hotYFrac
+            postInvalidate()
+        }
+
+        fun hide() {
+            visible = false
+            postInvalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            if (!visible) return
+            val px = xFrac * width
+            val py = yFrac * height
+            val bmp = bitmap
+            if (bmp != null) {
+                canvas.drawBitmap(bmp, px - bmp.width * hotXFrac, py - bmp.height * hotYFrac, null)
+            } else {
+                val r = 10f
+                canvas.drawCircle(px, py, r, dotFill)
+                canvas.drawCircle(px, py, r, dotOutline)
+            }
+        }
     }
 
     private fun feedDecoder(codec: MediaCodec, nalData: ByteArray) {
@@ -403,10 +708,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             else -> return
         }
         // Coordinates are normalized 0..1 against VIDEO space (section 7).
-        // Since the decoded video fills this SurfaceView, view size stands
-        // in for video size here.
-        val nx = (event.x / surfaceView.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-        val ny = (event.y / surfaceView.height.coerceAtLeast(1)).coerceIn(0f, 1f)
+        // The overlay is the same size as the SurfaceView underneath it
+        // (both match_parent in the same FrameLayout), so its dimensions
+        // stand in for video size here.
+        val nx = (event.x / cursorOverlay.width.coerceAtLeast(1)).coerceIn(0f, 1f)
+        val ny = (event.y / cursorOverlay.height.coerceAtLeast(1)).coerceIn(0f, 1f)
         sendControl(JSONObject().apply {
             put("type", "touch")
             put("phase", phase)
