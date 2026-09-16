@@ -1,5 +1,7 @@
 # OpenDisplay Android Receiver
 
+![CI](https://github.com/Dustin-08/opendisplay-android/actions/workflows/ci.yml/badge.svg)
+
 A personal, free, wireless alternative to Sidecar — turns an Android tablet
 into an extra Mac display (mirror → touch control → true extended display),
 using the [OpenDisplay](https://github.com/peetzweg/opendisplay) wire
@@ -54,6 +56,12 @@ Everything lives in `MainActivity.kt` for now (deliberately — see
 `docs/ARCHITECTURE.md` for the planned package split once it grows).
 Roughly top-to-bottom: NSD advertisement → TCP accept loop → framing →
 control-message handling → video decode → touch capture.
+
+## Contributing
+
+Branch naming, commit message format (Conventional Commits), PR rules, and
+the CI gate are in [`CONTRIBUTING.md`](CONTRIBUTING.md). Solo project, but
+following it anyway keeps history readable.
 
 ## License
 
